@@ -1,0 +1,124 @@
+name: PDF 自动展开成图片
+
+# 把 PDF 渲染成逐页图片，直接提交进本仓库（zz-img）。
+# 全程在 GitHub 服务器上跑，手机不花流量。
+# 已有 PDF 在 zz-pdf 里的话，pdf_url 直接填：
+#   https://raw.githubusercontent.com/aokid666/zz-pdf/main/pdf/xxx.pdf
+
+on:
+  workflow_dispatch:
+    inputs:
+      pdf_url:
+        description: '① PDF 直链（留空则用 pdf_path）'
+        required: false
+        default: ''
+      pdf_path:
+        description: '② 或仓库内已有 PDF 的路径（如 _incoming/book.pdf）'
+        required: false
+        default: ''
+      dest:
+        description: '输出目录'
+        required: true
+        default: 'img/new'
+      start:
+        description: '起始编号'
+        required: false
+        default: '1'
+      pad:
+        description: '文件名补零位数'
+        required: false
+        default: '4'
+      dpi:
+        description: '渲染 DPI（150 够看，300 更清晰但更大）'
+        required: false
+        default: '150'
+      format:
+        description: '格式：webp 或 jpg'
+        required: false
+        default: 'webp'
+      quality:
+        description: 'webp 质量 q 值（jpg 固定 95）'
+        required: false
+        default: '90'
+      first:
+        description: '起始页（留空=第 1 页）'
+        required: false
+        default: ''
+      last:
+        description: '结束页（留空=最后一页）'
+        required: false
+        default: ''
+      delete_pdf:
+        description: '处理完删掉仓库内的源 PDF（true/false）'
+        required: false
+        default: 'true'
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 poppler / webp
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq poppler-utils webp
+
+      - name: 取 PDF
+        run: |
+          set -e
+          mkdir -p /tmp/w
+          if [ -n "${{ inputs.pdf_url }}" ]; then
+            echo "从网址下载：${{ inputs.pdf_url }}"
+            curl -L --fail --retry 3 -A "Mozilla/5.0" -o /tmp/w/src.pdf "${{ inputs.pdf_url }}"
+          elif [ -n "${{ inputs.pdf_path }}" ]; then
+            echo "使用仓库内文件：${{ inputs.pdf_path }}"
+            cp "${{ inputs.pdf_path }}" /tmp/w/src.pdf
+          else
+            echo "::error::pdf_url 和 pdf_path 至少要填一个"; exit 1
+          fi
+          ls -lh /tmp/w/src.pdf
+          pdfinfo /tmp/w/src.pdf | sed -n '1,12p' | tee -a $GITHUB_STEP_SUMMARY
+
+      - name: 渲染成图
+        run: |
+          set -e
+          RANGE=""
+          if [ -n "${{ inputs.first }}" ]; then RANGE="-f ${{ inputs.first }}"; fi
+          if [ -n "${{ inputs.last }}" ];  then RANGE="$RANGE -l ${{ inputs.last }}"; fi
+          pdftoppm -jpeg -r ${{ inputs.dpi }} -jpegopt quality=95 $RANGE /tmp/w/src.pdf /tmp/w/pg
+          ls /tmp/w/pg-*.jpg | wc -l
+
+      - name: 转格式 + 重命名
+        run: |
+          set -e
+          mkdir -p "${{ inputs.dest }}"
+          i=${{ inputs.start }}
+          for f in $(ls /tmp/w/pg-*.jpg | sort -V); do
+            n=$(printf "%0${{ inputs.pad }}d" "$i")
+            if [ "${{ inputs.format }}" = "webp" ]; then
+              cwebp -q ${{ inputs.quality }} -m 2 -quiet "$f" -o "${{ inputs.dest }}/$n.webp"
+            else
+              cp "$f" "${{ inputs.dest }}/$n.jpg"
+            fi
+            i=$((i + 1))
+          done
+          echo "### 完成" >> $GITHUB_STEP_SUMMARY
+          echo "- 生成 **$((i - 1)) 张** → \`${{ inputs.dest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 体积：$(du -sh "${{ inputs.dest }}" | cut -f1)" >> $GITHUB_STEP_SUMMARY
+
+      - name: 提交并推送
+        run: |
+          set -e
+          git config user.name  github-actions
+          git config user.email actions@github.com
+          if [ "${{ inputs.delete_pdf }}" = "true" ] && [ -n "${{ inputs.pdf_path }}" ]; then
+            git rm -q "${{ inputs.pdf_path }}" || true
+          fi
+          git add -A
+          if git diff --cached --quiet; then
+            echo "没有变化，跳过提交"
+          else
+            git commit -q -m "render: ${{ inputs.dest }} ($(git diff --cached --name-only | wc -l) 文件)"
+            git push
+          fi
